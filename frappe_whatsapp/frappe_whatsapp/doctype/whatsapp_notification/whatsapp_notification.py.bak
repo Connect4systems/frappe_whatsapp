@@ -1,8 +1,6 @@
 """Notification."""
 
 import json
-import requests
-from frappe.utils.pdf import get_pdf
 import frappe
 
 from frappe import _dict, _
@@ -250,7 +248,7 @@ class WhatsAppNotification(Document):
             self.notify(data, doc_data)
 
     def notify(self, data, doc_data=None):
-        """Notify using WaPilot API."""
+        """Notify."""
         # Use notification WhatsApp account if available, otherwise use a default outgoing account
         if self.whatsapp_account:
             whatsapp_account = frappe.get_doc("WhatsApp Account", self.whatsapp_account)
@@ -262,130 +260,32 @@ class WhatsAppNotification(Document):
 
         token = whatsapp_account.get_password("token")
 
-        to_number = data.get("to")
-        if not to_number:
-            frappe.throw(_("WhatsApp recipient number is missing"))
-
-        to_number = str(to_number or "").strip()
-        to_number = to_number.replace("+", "").replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
-
-        # Egypt local mobile format: 010xxxxxxxx / 011xxxxxxxx / 012xxxxxxxx / 015xxxxxxxx
-        if to_number.startswith("0") and len(to_number) == 11:
-            to_number = "20" + to_number[1:]
-
-        chat_id = f"{to_number}@c.us"
-
-        text = ""
-        if data.get("text") and data.get("text", {}).get("body"):
-            text = data.get("text", {}).get("body")
-        elif data.get("template"):
-            template_name = data.get("template", {}).get("name") or self.template or "ERPNext WhatsApp Notification"
-            parameters = []
-            try:
-                components = data.get("template", {}).get("components") or []
-                for component in components:
-                    for param in component.get("parameters", []):
-                        if param.get("text"):
-                            parameters.append(str(param.get("text")))
-
-                template_doc = frappe.get_doc("WhatsApp Templates", self.template)
-                text = template_doc.template or template_name
-
-                for idx, value in enumerate(parameters, start=1):
-                    text = text.replace("{{" + str(idx) + "}}", str(value))
-
-            except Exception:
-                text = template_name
-        else:
-            text = "ERPNext WhatsApp Notification"
-
-        payload = {
-            "chat_id": chat_id,
-            "text": text,
-        }
-
         headers = {
-            "token": token,
+            "authorization": f"Bearer {token}",
             "content-type": "application/json"
         }
-
         try:
-            if self.attach_document_print and doc_data:
-                default_print_format = frappe.get_meta(doc_data.doctype).default_print_format or "Standard"
-
-                pdf_html = frappe.get_print(
-                    doc_data.doctype,
-                    doc_data.name,
-                    print_format=default_print_format,
-                    no_letterhead=0,
-                )
-                pdf_content = get_pdf(pdf_html)
-
-                file_payload = {
-                    "chat_id": chat_id,
-                    "caption": text,
-                }
-
-                files = {
-                    "media": (
-                        f"{doc_data.doctype} {doc_data.name}.pdf",
-                        pdf_content,
-                        "application/pdf",
-                    )
-                }
-
-                response_obj = requests.post(
-                    whatsapp_account.url.replace("send-message", "send-file"),
-                    data=file_payload,
-                    files=files,
-                    headers={"token": token},
-                    timeout=60,
-                )
-
-                try:
-                    response = response_obj.json()
-                except Exception:
-                    response = {"text": response_obj.text}
-
-                if response_obj.status_code >= 400:
-                    frappe.throw(response_obj.text)
-
-            else:
-                response = make_post_request(
-                    whatsapp_account.url,
-                    headers=headers,
-                    data=json.dumps(payload)
-                )
+            success = False
+            response = make_post_request(
+                f"{whatsapp_account.url}/{whatsapp_account.version}/{whatsapp_account.phone_id}/messages",
+                headers=headers, data=json.dumps(data)
+            )
 
             if not self.get("content_type"):
                 self.content_type = 'text'
 
             parameters = None
-            if data.get("template", {}).get("components"):
-                try:
-                    parameters = []
-                    for component in data["template"]["components"]:
-                        for param in component.get("parameters", []):
-                            if param.get("text"):
-                                parameters.append(param.get("text"))
-                    parameters = frappe.json.dumps(parameters, default=str)
-                except Exception:
-                    parameters = None
-
-            message_id = (
-                response.get("id")
-                or response.get("message_id")
-                or response.get("data", {}).get("id")
-                or chat_id
-            )
+            if data["template"]["components"]:
+                parameters = [param["text"] for param in data["template"]["components"][0]["parameters"]]
+                parameters = frappe.json.dumps(parameters, default=str)
 
             new_doc = {
                 "doctype": "WhatsApp Message",
                 "type": "Outgoing",
-                "message": text,
+                "message": str(data['template']),
                 "to": data['to'],
                 "message_type": "Template",
-                "message_id": message_id,
+                "message_id": response['messages'][0]['id'],
                 "content_type": self.content_type,
                 "use_template": 1,
                 "template": self.template,
@@ -414,21 +314,31 @@ class WhatsAppNotification(Document):
                         frappe.db.set_value(doc_data.get("doctype"), doc_data.get("name"), fieldname, value)
 
             frappe.msgprint("WhatsApp Message Triggered", indicator="green", alert=True)
+            success = True
 
         except Exception as e:
             error_message = str(e)
-            frappe.get_doc(
-                {
-                    "doctype": "WhatsApp Notification Log",
-                    "template": self.template or "Text Message",
-                    "meta_data": {
-                        "error": error_message,
-                        "payload": payload,
-                    },
-                }
-            ).insert(ignore_permissions=True)
+            if frappe.flags.integration_request:
+                response = frappe.flags.integration_request.json().get('error', {})
+                if response:
+                    error_message = response.get('Error', response.get("message"))
 
-            frappe.throw(msg=error_message, title="WaPilot Error")
+            frappe.msgprint(
+                f"Failed to trigger whatsapp message: {error_message}",
+                indicator="red",
+                alert=True
+            )
+        finally:
+            if not success:
+                meta = {"error": error_message}
+            else:
+                meta = frappe.flags.integration_request.json()
+            frappe.get_doc({
+                "doctype": "WhatsApp Notification Log",
+                "template": self.template,
+                "meta_data": meta
+            }).insert(ignore_permissions=True)
+
 
     def on_trash(self):
         """On delete remove from schedule."""

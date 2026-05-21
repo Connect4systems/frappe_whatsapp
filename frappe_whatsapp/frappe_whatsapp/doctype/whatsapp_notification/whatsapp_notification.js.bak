@@ -96,8 +96,8 @@ frappe.ui.form.on('WhatsApp Notification', {
 						}
 					}else{
 						frm.toggle_display("custom_attachment", false);
-						frm.toggle_display("attach_document_print", true);
-						// frm.set_value("attach_document_print", 0)
+						frm.toggle_display("attach_document_print", false);
+						frm.set_value("attach_document_print", 0)
 						frm.set_value("custom_attachment", 0)
 					}
 
